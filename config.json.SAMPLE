@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "n8n_url": "https://n8n.yourdomainname.com.np/webhook-test/error-tracing",
+  "log_file": "/var/log/apache2/error.log"
+}
