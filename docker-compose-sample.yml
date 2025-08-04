@@ -1,0 +1,9 @@
+
+services:
+  logwatcher:
+    build: .
+    container_name: logwatcher
+    volumes:
+      - /var/log/apache2:/logs:ro
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped
