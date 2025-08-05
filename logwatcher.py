@@ -48,9 +48,9 @@ class LogWatcher:
         self.error_start_pattern = re.compile(r'(PHP (Fatal error|Warning|Notice)|\[error\])', re.IGNORECASE)
 
         self.vhost_cache = {}  # Forever cache
-        self.git_root_cache = TTLCache(maxsize=1000, ttl=86400)
-        self.git_remote_cache = TTLCache(maxsize=1000, ttl=86400)
-        self.git_blame_cache = TTLCache(maxsize=5000, ttl=86400)
+        self.git_root_cache = TTLCache(maxsize=1000, ttl=86400) # Max size 1000, TTL 1 day
+        self.git_remote_cache = TTLCache(maxsize=1000, ttl=86400) # Max size 1000, TTL 1 day
+        self.git_blame_cache = TTLCache(maxsize=5000, ttl=86400) # Max size 5000, TTL 1 day
 
         self.session = requests.Session()
 
