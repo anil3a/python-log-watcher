@@ -4,8 +4,7 @@ import os
 import time
 import requests
 import re
-import logging
-import signal
+import datetime
 from cachetools import TTLCache
 
 class LogWatcher:
@@ -19,7 +18,7 @@ class LogWatcher:
     - Groups multi-line PHP stack traces.
     - Identifies file, line, vhost, Git remote, and blame information.
     - Forwards payload to n8n endpoint as JSON.
-    - Uses persistent HTTP session and caching for efficiency.
+    - Uses persistent HTTP session and intelligent in-memory caching to remain efficient in high-traffic environments.
 
     Caches:
     - vhost_cache (dict): Forever cached since vhost config rarely changes.
@@ -41,83 +40,41 @@ class LogWatcher:
             reload_interval (int): Seconds between config reloads.
 
         Raises:
-            ValueError: If config is invalid or missing required keys.
+            Exception if config loading fails (logged, but not thrown)
         """
-        self.logger = logging.getLogger(__name__)
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[
-                logging.FileHandler('logwatcher.log'),
-                logging.StreamHandler()
-            ]
-        )
         self.config_path = config_path
         self.reload_interval = reload_interval
         self.config = {}
         self.last_config_load_time = 0
-        self.running = True
         self.load_config()
+        # Updated regex to catch all PHP error types and MySQL errors
         self.error_start_pattern = re.compile(
-            r'(PHP (Fatal error|Warning|Notice|Parse error)|\[error\])', re.IGNORECASE
+            r'(PHP (Fatal error|Warning|Notice|Parse error|Deprecated)|MySQL Error|\[error\])',
+            re.IGNORECASE
         )
+
         self.vhost_cache = {}  # Forever cache
-        self.git_root_cache = TTLCache(maxsize=1000, ttl=3600)  # TTL 1 hour
-        self.git_remote_cache = TTLCache(maxsize=1000, ttl=3600)  # TTL 1 hour
-        self.git_blame_cache = TTLCache(maxsize=5000, ttl=3600)  # TTL 1 hour
+        self.git_root_cache = TTLCache(maxsize=1000, ttl=86400)
+        self.git_remote_cache = TTLCache(maxsize=1000, ttl=86400)
+        self.git_blame_cache = TTLCache(maxsize=5000, ttl=86400)
+
         self.session = requests.Session()
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
-        self.check_dependencies()
-
-    def signal_handler(self, signum, frame):
-        """
-        Handles shutdown signals (SIGINT, SIGTERM) for graceful exit.
-
-        Args:
-            signum (int): Signal number.
-            frame: Current stack frame.
-        """
-        self.logger.info("Received shutdown signal, stopping...")
-        self.running = False
-        self.session.close()
-
-    def check_dependencies(self):
-        """
-        Checks for required dependencies (git, vhost directory).
-        """
-        try:
-            subprocess.run(['git', '--version'], capture_output=True, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            self.logger.error("Git is not installed or not in PATH")
-        vhost_dir = self.config.get('vhost_dir', '/etc/apache2/sites-enabled')
-        if not os.path.exists(vhost_dir):
-            self.logger.warning(f"Vhost directory does not exist: {vhost_dir}")
 
     def load_config(self):
         """
         Loads JSON config from disk into self.config.
-        Expected keys: 'log_file', 'enabled', 'n8n_url', 'vhost_dir' (optional).
+        Expected keys: 'log_file', 'enabled', 'n8n_url'
 
-        Raises:
-            ValueError: If required keys are missing or invalid.
+        Exceptions:
+            Catches and logs any file or JSON error.
         """
         try:
             with open(self.config_path) as f:
                 self.config = json.load(f)
-            required_keys = {'log_file', 'enabled', 'n8n_url'}
-            missing_keys = required_keys - set(self.config.keys())
-            if missing_keys:
-                raise ValueError(f"Missing required config keys: {missing_keys}")
-            if not isinstance(self.config['enabled'], bool):
-                raise ValueError("'enabled' must be a boolean")
-            if not os.path.isfile(self.config['log_file']):
-                raise ValueError(f"Log file does not exist: {self.config['log_file']}")
             self.last_config_load_time = time.time()
-            self.logger.info(f"Loaded config: {self.config}")
+            print(f"[CONFIG] Loaded config: {self.config}")
         except Exception as e:
-            self.logger.error(f"Failed to load config: {e}")
-            self.config = {}
+            print(f"[CONFIG] Failed to load config: {e}")
 
     def config_needs_reload(self):
         """
@@ -133,40 +90,42 @@ class LogWatcher:
         Sends the error trace to the n8n webhook defined in config.
 
         Args:
-            error_trace (str): Full PHP error message trace (possibly multi-line).
+            error_trace (str): The full error message trace (possibly multi-line)
+
+        Exceptions:
+            Handles connection and timeout errors to n8n.
         """
         n8n_url = self.config.get("n8n_url")
         if not n8n_url:
-            self.logger.warning("n8n URL not set in config")
+            print("[WARN] n8n URL not set in config.")
             return
 
         try:
             error_detail = self.get_project_info(error_trace)
-            self.logger.info("Sending error trace to n8n")
-            self.session.post(
-                n8n_url,
-                json={"error_line": error_trace, "error_detail": error_detail},
-                timeout=2
-            )
+            print(f"[SEND] Sending error trace to n8n:")
+            self.session.post(n8n_url, json={"error_line": error_trace, "error_detail": error_detail}, timeout=2)
         except Exception as e:
-            self.logger.error(f"Failed to send to n8n: {e}")
+            print(f"[ERROR] Failed to send to n8n: \n{e}")
 
     def tail_log(self):
         """
         Generator that tails the Apache error log and yields grouped PHP error traces.
 
         Yields:
-            str: Multi-line PHP error trace strings.
+            str: Multi-line error trace strings.
+
+        Raises:
+            Logs missing log file or access issues.
         """
         log_file = self.config.get("log_file")
         if not log_file or not os.path.isfile(log_file):
-            self.logger.error(f"Invalid or missing log file: {log_file}")
+            print(f"[ERROR] Invalid or missing log file: {log_file}")
             return
 
         with open(log_file, 'r') as f:
             f.seek(0, os.SEEK_END)
             current_trace = []
-            while self.running:
+            while True:
                 line = f.readline()
                 if not line:
                     time.sleep(0.5)
@@ -177,50 +136,50 @@ class LogWatcher:
                     if current_trace:
                         yield "\n".join(current_trace)
                         current_trace = []
+
                 current_trace.append(line)
 
-                start_time = time.time()
-                timeout = 2  # seconds
-                while self.running:
+                fcntl_wait_time = 2
+                fcntl_start_time = time.time()
+                while True:
                     next_line = f.readline()
                     if not next_line:
-                        if time.time() - start_time >= timeout:
-                            if current_trace:
-                                yield "\n".join(current_trace)
-                                current_trace = []
+                        if time.time() - fcntl_start_time >= fcntl_wait_time:
+                            yield "\n".join(current_trace)
+                            current_trace = []
                             break
                         time.sleep(0.2)
                         continue
                     next_line = next_line.strip()
                     current_trace.append(next_line)
-                    start_time = time.time()
+                    fcntl_start_time = time.time()
 
     def run(self):
         """
         Starts the log watcher loop, monitoring Apache error logs and sending PHP errors to n8n.
         """
-        self.logger.info("LogWatcher started with PHP error trace grouping")
+        print("[INFO] LogWatcher started with error trace grouping.")
         for error_trace in self.tail_log():
-            if not self.running:
-                break
             if self.config_needs_reload():
                 self.load_config()
+
             if not self.config.get("enabled", False):
-                self.logger.info("Sending disabled via config")
+                print("[INFO] Sending disabled via config.")
                 continue
+
             self.send_to_n8n(error_trace)
 
-    def find_vhost_for_path(self, file_path):
+    def find_vhost_for_path(self, file_path, vhost_dir='/etc/apache2/sites-enabled'):
         """
-        Finds the Apache vhost config for a given file path.
+        Finds the matching Apache vhost config for a given file path.
 
         Args:
-            file_path (str): Full file path of the error file.
+            file_path (str): The full file path of the error file.
+            vhost_dir (str): Apache vhost directory to search.
 
         Returns:
             str | None: Path to matching vhost file, or None if not found.
         """
-        vhost_dir = self.config.get('vhost_dir', '/etc/apache2/sites-enabled')
         if file_path in self.vhost_cache:
             return self.vhost_cache[file_path]
 
@@ -228,18 +187,11 @@ class LogWatcher:
         found_vhost = None
 
         while True:
-            try:
-                result = subprocess.run(
-                    ['grep', '-l', search_path, f'{vhost_dir}/*'],
-                    capture_output=True,
-                    text=True,
-                    check=False
-                )
-                found_vhost = result.stdout.strip()
-                if found_vhost:
-                    break
-            except subprocess.CalledProcessError:
-                pass
+            cmd = f"grep -l '{search_path}' {vhost_dir}/* || true"
+            result = subprocess.getoutput(cmd).strip()
+            if result:
+                found_vhost = result
+                break
             parent_path = os.path.dirname(search_path)
             if parent_path == search_path or parent_path == '/':
                 break
@@ -256,20 +208,29 @@ class LogWatcher:
             error_line (str): Line or trace containing file path and line number.
 
         Returns:
-            dict | None: Structured metadata or None if file not found.
+            dict | None: Structured metadata dictionary or None if file not found.
         """
-        match = re.search(r'in (.+?) on line (\d+)', error_line)
-        if not match:
-            return None
 
-        file_path, line_number = match.groups()
+        # Extract file path and line number, handling eval() and standard cases
+        match = re.search(r'in ([^\s]+?)(?:\((\d+)\) : eval\(\)\'d code)? on line (\d+)', error_line)
+        if not match:
+            return {
+                "file": None,
+                "line": None,
+                "vhost": None,
+                "git_remote": None,
+                "stack_trace": "Stack trace:" in error_line,
+                "blame": None
+            }
+
+        file_path, eval_line, line_number = match.groups()
         file_path = file_path.strip()
         line_number = int(line_number)
-        dir_path = os.path.abspath(os.path.dirname(file_path))
+        dir_path = os.path.abspath(os.path.dirname(file_path)) if file_path != 'eval()' else None
 
-        vhost = self.find_vhost_for_path(file_path)
+        vhost = self.find_vhost_for_path(file_path) if file_path != 'eval()' else None
 
-        if dir_path in self.git_root_cache:
+        if dir_path and dir_path in self.git_root_cache:
             repo_root = self.git_root_cache[dir_path]
         else:
             try:
@@ -277,29 +238,25 @@ class LogWatcher:
                     ["git", "rev-parse", "--show-toplevel"],
                     cwd=dir_path,
                     text=True
-                ).strip()
+                ).strip() if dir_path else None
             except subprocess.CalledProcessError:
                 repo_root = None
-            self.git_root_cache[dir_path] = repo_root
+            if dir_path:
+                self.git_root_cache[dir_path] = repo_root
 
-        if dir_path in self.git_remote_cache:
+        if dir_path and dir_path in self.git_remote_cache:
             git_remote = self.git_remote_cache[dir_path]
         else:
-            try:
-                git_remote = subprocess.check_output(
-                    ["git", "config", "--get", "remote.origin.url"],
-                    cwd=dir_path,
-                    text=True
-                ).strip() or 'unknown'
-            except subprocess.CalledProcessError:
-                git_remote = 'unknown'
-            self.git_remote_cache[dir_path] = git_remote
+            git_remote = subprocess.getoutput(
+                f"cd '{dir_path}' && git config --get remote.origin.url || echo 'unknown'"
+            ).strip() if dir_path else 'unknown'
+            if dir_path:
+                self.git_remote_cache[dir_path] = git_remote
 
-        blame_key = f"{file_path}:{line_number}"
-        if blame_key in self.git_blame_cache:
-            blame = self.git_blame_cache[blame_key]
-        else:
-            blame = self.get_git_blame(file_path, line_number, repo_root)
+        blame_key = f"{file_path}:{line_number}" if file_path != 'eval()' else None
+
+        blame = self.get_git_blame(file_path, line_number, repo_root) if blame_key else None
+        if blame_key:
             self.git_blame_cache[blame_key] = blame
 
         return {
@@ -307,7 +264,7 @@ class LogWatcher:
             "line": line_number,
             "vhost": vhost.strip() if vhost else None,
             "git_remote": git_remote,
-            "error_line": error_line.strip(),
+            "stack_trace": "Stack trace:" in error_line,
             "blame": blame
         }
 
@@ -321,9 +278,9 @@ class LogWatcher:
             repo_path (str | None): Git repository root directory.
 
         Returns:
-            dict | None: Author, email, summary, commit hash, or None if unavailable.
+            dict | None: Author, email, summary, commit hash and local_changes or None if unavailable. Summary can have local changes details
         """
-        if not repo_path:
+        if not repo_path or file_path == 'eval()':
             return None
 
         try:
@@ -338,10 +295,13 @@ class LogWatcher:
                 "author": None,
                 "email": None,
                 "commit": None,
-                "summary": None
+                "summary": None,
+                "is_local_changes": False
             }
 
             for line in blame_output.splitlines():
+                if re.match(r"^0{8,40}", line):  # Uncommitted line marked by all-zero commit
+                    blame["is_local_changes"] = True
                 if line.startswith("author "):
                     blame["author"] = line[7:]
                 elif line.startswith("author-mail "):
@@ -351,10 +311,42 @@ class LogWatcher:
                 elif re.match(r"^[a-f0-9]{40}", line):
                     blame["commit"] = line.split()[0][:8]
 
+            if blame["is_local_changes"]:
+                # Read git diff only for that file
+                diff_output = subprocess.check_output(
+                    ["git", "diff", rel_path],
+                    cwd=repo_path,
+                    text=True
+                )
+                # Find diff line related to the requested line number
+                line_diff = None
+                hunk_header_pattern = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@')
+                current_line = 0
+
+                for diff_line in diff_output.splitlines():
+                    match = hunk_header_pattern.match(diff_line)
+                    in_hunk = True
+                    if match:
+                        start_line = int(match.group(1))
+                        line_count = int(match.group(2)) if match.group(2) else 1
+                        current_line = start_line
+                        in_hunk = (start_line <= line_number < start_line + line_count)
+                    elif in_hunk and (diff_line.startswith('+') or diff_line.startswith('-') or diff_line.startswith(' ')):
+                        if current_line == line_number:
+                            line_diff = diff_line
+                            break
+                        if not diff_line.startswith('-'):
+                            current_line += 1
+
+                last_modified = datetime.datetime.fromtimestamp(os.path.getmtime(file_path)).isoformat()
+                blame["summary"] = f"[Uncommitted changes] Last modified: {last_modified}"
+                if line_diff:
+                    blame["summary"] += f" | Diff line: {line_diff.strip()}"
+
             return blame
 
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"Git blame failed: {e}")
+            print(f"[blame error] {e}")
             return None
 
 if __name__ == '__main__':
