@@ -93,3 +93,15 @@ docker-compose up --build -d
 * Requires `git` installed and accessible in `PATH`
 * Works best on systems using Apache logs
 * Tested on Linux (Debian/Ubuntu)
+
+
+### Change log
+
+* V1 is the first attempt to read error log
+* V2 is the second attempt more enhancements
+    * Uses cache tools to cache some variables for fast processing
+    * Handles more error types
+    * Parse more error types
+    * More info in git details
+    * Checks for local changs
+    * An attempt to auto generate documentation using 

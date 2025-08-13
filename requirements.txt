@@ -1,2 +1,2 @@
-requests
-cachetools
+requests>=2.28.0
+cachetools>=5.0.0

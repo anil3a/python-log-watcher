@@ -5,3 +5,6 @@ __pycache__/
 *.log
 config.json
 docker-compose.yml
+
+venv/*
+docs/*
